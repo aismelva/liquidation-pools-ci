@@ -1,21 +1,14 @@
 """
-Backtesting del modelo de pools de liquidación — Fase 2b (v2)
+Backtesting del modelo de pools de liquidación — Fase 2b (v3)
 
-v1 enseñó una lección de diseño: comparar el hit-rate del modelo contra niveles
-aleatorios uniformes es injusto (los pools del modelo están lejos del precio por
-construcción: son supervivientes del barrido y el 40% del peso está en 10x = ±10%).
-El 'azar' ganaba por colocar niveles cerca, no por saber nada.
-
-v2 evalúa lo que de verdad testa el conocimiento del modelo:
-  CAPTURA: ¿qué % del USD realmente liquidado ocurre a < NEAR_PCT de un pool
-  predicho (del lado correcto), comparado con niveles aleatorios?
-  - null uniforme: N niveles aleatorios en ±10% (lado aleatorio)
-  - null distancia-emparejada: mismos N, mismas distancias que el modelo,
-    lados aleatorios — el test más estricto
-
-El hit-rate se reporta solo como descriptivo (perfil de distancia del mapa),
-no como prueba de habilidad: dado un nivel a distancia d y lado s, que el precio
-lo toque es determinista — cualquier nivel igual de lejos se toca igual.
+v1: hit-rate vs azar uniforme — injusto (los pools del modelo están lejos por
+    construcción; el azar ganaba por colocar niveles cerca).
+v2: captura vs nulls (uniforme y distancia-emparejada) con lookahead 12h.
+    Resultado: gana al emparejado (+7 pts) pero pierde al uniforme (-6.5 pts):
+    en 12h las liquidaciones ocurren cerca del precio, donde el modelo por
+    diseño no señala.
+v3: lookahead configurable por entorno (default 48h) — el mapa de pools es una
+    herramienta de días, no de horas.
 
 Resultados -> results/last_backtest.md (el CI los commitea al repo).
 
@@ -42,9 +35,9 @@ from pool_model import (
 
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
 DAYS = int(os.environ.get("LIQ_DAYS", "7"))
+LOOKAHEAD_H = int(os.environ.get("LIQ_LOOKAHEAD_H", "48"))  # v3: horizonte de días
 
 WINDOW_DAYS = 1      # historia para construir el mapa en cada paso
-LOOKAHEAD_H = 12     # horizonte de predicción a validar
 STEP_H = 6           # paso entre evaluaciones
 TOP_N = 15           # pools más grandes a evaluar
 NEAR_PCT = 0.005     # 0.5% de distancia para considerar liquidación "en el pool"
@@ -145,7 +138,7 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
 
 def main() -> None:
     hours = hourly_targets()
-    print(f"Backtest v2 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
+    print(f"Backtest v3 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
           f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
@@ -178,22 +171,23 @@ def main() -> None:
 
     print("\n========== RESUMEN ==========")
     print(f"Evaluaciones:                     {len(df)}")
+    print(f"Lookahead:                        {LOOKAHEAD_H}h")
     print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
     print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
     print(f"Captura del modelo:               {cap_m*100:.1f}%")
     print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
     print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
     print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
-    print(f"Ventaja vs dist-emparejada:       {(cap_mm and (cap_m-cap_mm))*100:+.1f} puntos")
+    print(f"Ventaja vs dist-emparejada:       {(cap_m-cap_mm)*100:+.1f} puntos")
 
     edge_u = (cap_m - cap_u) * 100
     edge_m = (cap_m - cap_mm) * 100
     if edge_m > 0 and edge_u > 0:
         verdict = ("El modelo captura más liquidaciones reales que ambos nulls: "
                    "hay señal de localización.")
-    elif edge_u > 0:
-        verdict = ("El modelo supera al azar uniforme pero no al null "
-                   "distancia-emparejado: señal débil o nula.")
+    elif edge_m > 0:
+        verdict = ("El modelo supera el null estricto (distancia-emparejada) "
+                   "pero no al uniforme: señal de ubicación, horizonte aún corto.")
     else:
         verdict = "El modelo NO supera a los nulls: sin señal en esta muestra."
 
@@ -202,7 +196,7 @@ def main() -> None:
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest (v2) — {SYMBOL}",
+        f"# Resultado del último backtest (v3) — {SYMBOL}",
         "",
         f"- Ejecutado: {now}",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
@@ -231,7 +225,7 @@ def main() -> None:
     assert df.capture.between(0, 1).all()
     assert df.null_u.between(0, 1).all()
     assert df.null_m.between(0, 1).all()
-    print("✅ Test OK: backtest v2 ejecutado con datos reales.")
+    print("✅ Test OK: backtest v3 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
