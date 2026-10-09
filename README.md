@@ -1,2 +1,7 @@
-# liquidation-pools-ci
-CI público del proyecto liquidation-pools — test automatizado con datos reales de CryptoHFTData
+# CI repo del proyecto liquidation-pools
+
+Ejecuta el test del análisis de pools de liquidación con datos reales de CryptoHFTData (sin API key). El desarrollo principal está en el repo privado `liquidation-pools`; este repo público existe para poder monitorear los resultados de GitHub Actions.
+
+## Créditos de datos
+
+- Liquidation data: [CryptoHFTData](https://www.cryptohftdata.com)
