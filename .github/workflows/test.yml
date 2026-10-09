@@ -49,9 +49,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Fase 2b — backtesting walk-forward del modelo contra liquidaciones reales
+      - name: Fase 2b — backtesting v3 (lookahead 48h) del modelo contra liquidaciones reales
         env:
           LIQ_DAYS: "7"
+          LIQ_LOOKAHEAD_H: "48"
         run: python src/backtest.py
       - name: Publicar resultados al repo
         run: |
