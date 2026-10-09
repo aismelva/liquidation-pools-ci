@@ -21,7 +21,7 @@ Algoritmo v1:
 
 Simplificaciones honestas de v1 (a iterar en backtesting):
   - Split long/short es heurístico (sin datos reales de posicionamiento por venue)
-  - Caídas de OI aún no descuentan cohetes (v2: descuento FIFO)
+  - Caídas de OI aún no descuentan cohortes (v2: descuento FIFO)
   - Fórmula de liquidación sin margen de mantenimiento
 """
 
