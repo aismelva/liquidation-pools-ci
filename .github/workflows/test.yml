@@ -6,19 +6,30 @@ on:
   workflow_dispatch:
 
 jobs:
-  analyze-liquidations:
+  fase1-clusteres:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
-
-      - name: Ejecutar análisis de pools de liquidación (datos reales, sin API key)
+      - run: pip install -r requirements.txt
+      - name: Fase 1 — análisis de clústeres de liquidación (datos reales, sin API key)
         run: python src/liquidation_analysis.py
+
+  fase2-modelo-pools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Fase 2 — modelo de pools de liquidación (cohortes de OI, datos reales)
+        env:
+          LIQ_DAYS: "3"
+        run: python src/pool_model.py
