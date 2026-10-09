@@ -1,30 +1,29 @@
 """
 Backtesting del modelo de pools de liquidación — Fase 2b
 
-Validación walk-forward del modelo (pool_model.py) contra liquidaciones reales:
+Validación walk-forward del modelo (pool_model.py) contra liquidaciones reales.
+Los resultados se guardan en results/last_backtest.md (el CI los commitea al repo
+para poder leerlos sin depender de la API de Actions).
 
   1. En cada paso t (cada STEP_H horas):
      - Entrena el modelo con la ventana de WINDOW_DAYS anterior a t
      - Toma los TOP_N pools más grandes (nivel, lado, USD)
   2. Mira hacia delante LOOKAHEAD_H horas y comprueba:
-     - HIT: ¿el precio tocó el nivel del pool? (long: mín <= nivel; short: máx >= nivel)
+     - HIT: ¿el precio tocó el nivel del pool?
      - CAPTURA: qué % de las liquidaciones reales ocurrió a < NEAR_PCT del nivel
-  3. Compara contra BASELINE aleatorio: mismos N niveles, posicionados al azar
-     en el rango +-10% del precio (las distancias que la fórmula de apalancamiento
-     permite). Si el modelo no supera al azar, no hay señal.
+  3. Compara contra BASELINE aleatorio: mismos N niveles posicionados al azar
+     en el rango ±10% del precio. Si el modelo no supera al azar, no hay señal.
 
-Limitaciones honestas de esta v1 de backtest:
-  - Las liquidaciones de Binance vienen capadas (hasta 1 BTC/evento): las
-    magnitudes absolutas están sesgadas a la baja, pero las UBICACIONES sí son reales
-    (la validación se basa sobre todo en hit-rate y captura, no en magnitudes).
-  - El hit-rate tiene sesgo mecánico (un nivel cercano se toca con más
-    probabilidad); el baseline uniforme mitiga pero no elimina este sesgo.
-  - Muestra pequeña (días de free tier). Con la API key gratuita se puede
-    extender a meses.
+Limitaciones honestas de esta v1:
+  - Liquidaciones de Binance capadas (hasta 1 BTC/evento): magnitudes sesgadas
+    a la baja, pero las UBICACIONES son reales.
+  - El hit-rate tiene sesgo mecánico; el baseline mitiga pero no elimina.
+  - Muestra pequeña (free tier). Ampliable a meses con API key gratuita.
 """
 
 import os
 import sys
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -55,7 +54,6 @@ def prep_liquidations(liq_raw: pd.DataFrame) -> pd.DataFrame:
     df["exec_px"] = df["average_price"].astype(float)
     df["usd"] = df["quantity"].astype(float) * df["exec_px"]
     df["is_long_liq"] = df["side"] == "SELL"  # SELL = long liquidado
-    # event_time es ms en Binance Futures (binance_futures only, verificado en el esquema)
     df["ts"] = pd.to_datetime(df["event_time"].astype("int64"), unit="ms")
     return df[["ts", "exec_px", "usd", "is_long_liq"]]
 
@@ -81,14 +79,12 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
     px0 = float(train["px"].iloc[-1])
     lo, hi = float(test["px"].min()), float(test["px"].max())
 
-    # ---- Modelo: ¿se tocaron los niveles? ----
     model_hits = []
     for _, p in pools.iterrows():
         touched = (p.side == "long" and lo <= p.bucket) or (p.side == "short" and hi >= p.bucket)
         model_hits.append(bool(touched))
     model_hit = float(np.mean(model_hits))
 
-    # ---- Baseline aleatorio (mismo N de niveles, rango +-10%) ----
     base_hits = []
     for _ in range(BASELINE_DRAWS):
         lv = RNG.uniform(px0 * 0.90, px0 * 1.10, size=len(pools))
@@ -100,7 +96,6 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
         base_hits.append(float(th))
     base_hit = float(np.mean(base_hits))
 
-    # ---- Captura: liquidaciones reales cerca de los pools (del lado correcto) ----
     look = liq[(liq.ts >= start) & (liq.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
     if len(look) > 0 and look.usd.sum() > 0:
         near_usd = 0.0
@@ -118,8 +113,6 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
         "model_hit": model_hit,
         "base_hit": base_hit,
         "capture": capture,
-        "px_lo": lo,
-        "px_hi": hi,
     }
 
 
@@ -158,19 +151,47 @@ def main() -> None:
     print(f"Hit-rate del azar:       {df.base_hit.mean()*100:.1f}%")
     edge = (df.model_hit.mean() - df.base_hit.mean()) * 100
     print(f"Ventaja sobre el azar:   {edge:+.1f} puntos")
-    if df.capture.notna().any():
-        print(f"Captura media:           {df.capture.mean()*100:.1f}% "
+    capture_mean = df.capture.mean() if df.capture.notna().any() else float("nan")
+    if capture_mean == capture_mean:
+        print(f"Captura media:           {capture_mean*100:.1f}% "
               f"(liquidaciones reales ocurridas en pools predichos)")
 
     if edge > 0:
-        print("\n✅ El modelo supera al baseline aleatorio en esta muestra.")
+        verdict = "El modelo SUPERA al baseline aleatorio en esta muestra."
     else:
-        print("\n⚠️ El modelo NO supera al azar en esta muestra: ajustar parámetros.")
-    print("   (Muestra limitada por el free tier; ampliable a meses con API key gratuita.)")
+        verdict = "El modelo NO supera al azar en esta muestra: ajustar parámetros."
+    print(f"\n{verdict}")
+
+    # ---- Guardar resultados en el repo (el CI los commitea) ----
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"# Resultado del último backtest — {SYMBOL}",
+        "",
+        f"- Ejecutado: {now}",
+        f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
+        f"paso {STEP_H}h · top {TOP_N} pools",
+        f"- Evaluaciones: {len(df)}",
+        f"- Hit-rate modelo: **{df.model_hit.mean()*100:.1f}%**",
+        f"- Hit-rate azar: **{df.base_hit.mean()*100:.1f}%**",
+        f"- Ventaja: **{edge:+.1f} puntos**",
+    ]
+    if capture_mean == capture_mean:
+        lines.append(f"- Captura media: **{capture_mean*100:.1f}%**")
+    lines += ["", "## Por evaluación", "",
+              "| Paso | Hit modelo | Hit azar | Captura |", "|---|---|---|---|"]
+    for _, r in df.iterrows():
+        cap = f"{r.capture*100:.1f}%" if r.capture == r.capture else "n/a"
+        lines.append(f"| {r['start']} | {r.model_hit*100:.0f}% | {r.base_hit*100:.0f}% | {cap} |")
+    lines += ["", f"**Veredicto:** {verdict}",
+              "", "_Muestra limitada por el free tier; ampliable a meses con API key gratuita._"]
+    os.makedirs("results", exist_ok=True)
+    with open("results/last_backtest.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n📄 Resultados guardados en results/last_backtest.md")
 
     assert df.model_hit.between(0, 1).all()
     assert df.base_hit.between(0, 1).all()
-    print("\n✅ Test OK: backtest ejecutado con datos reales.")
+    print("✅ Test OK: backtest ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
