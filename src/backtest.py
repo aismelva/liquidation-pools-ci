@@ -1,23 +1,27 @@
 """
-Backtesting del modelo de pools de liquidación — Fase 2b
+Backtesting del modelo de pools de liquidación — Fase 2b (v2)
 
-Validación walk-forward del modelo (pool_model.py) contra liquidaciones reales.
-Los resultados se guardan en results/last_backtest.md (el CI los commitea al repo
-para poder leerlos sin depender de la API de Actions).
+v1 enseñó una lección de diseño: comparar el hit-rate del modelo contra niveles
+aleatorios uniformes es injusto (los pools del modelo están lejos del precio por
+construcción: son supervivientes del barrido y el 40% del peso está en 10x = ±10%).
+El 'azar' ganaba por colocar niveles cerca, no por saber nada.
 
-  1. En cada paso t (cada STEP_H horas):
-     - Entrena el modelo con la ventana de WINDOW_DAYS anterior a t
-     - Toma los TOP_N pools más grandes (nivel, lado, USD)
-  2. Mira hacia delante LOOKAHEAD_H horas y comprueba:
-     - HIT: ¿el precio tocó el nivel del pool?
-     - CAPTURA: qué % de las liquidaciones reales ocurrió a < NEAR_PCT del nivel
-  3. Compara contra BASELINE aleatorio: mismos N niveles posicionados al azar
-     en el rango ±10% del precio. Si el modelo no supera al azar, no hay señal.
+v2 evalúa lo que de verdad testa el conocimiento del modelo:
+  CAPTURA: ¿qué % del USD realmente liquidado ocurre a < NEAR_PCT de un pool
+  predicho (del lado correcto), comparado con niveles aleatorios?
+  - null uniforme: N niveles aleatorios en ±10% (lado aleatorio)
+  - null distancia-emparejada: mismos N, mismas distancias que el modelo,
+    lados aleatorios — el test más estricto
 
-Limitaciones honestas de esta v1:
-  - Liquidaciones de Binance capadas (hasta 1 BTC/evento): magnitudes sesgadas
-    a la baja, pero las UBICACIONES son reales.
-  - El hit-rate tiene sesgo mecánico; el baseline mitiga pero no elimina.
+El hit-rate se reporta solo como descriptivo (perfil de distancia del mapa),
+no como prueba de habilidad: dado un nivel a distancia d y lado s, que el precio
+lo toque es determinista — cualquier nivel igual de lejos se toca igual.
+
+Resultados -> results/last_backtest.md (el CI los commitea al repo).
+
+Limitaciones honestas:
+  - Liquidaciones de Binance capadas (1 BTC/evento): magnitudes sesgadas a la
+    baja, pero las UBICACIONES son reales (la validación se basa en ubicación).
   - Muestra pequeña (free tier). Ampliable a meses con API key gratuita.
 """
 
@@ -44,7 +48,7 @@ LOOKAHEAD_H = 12     # horizonte de predicción a validar
 STEP_H = 6           # paso entre evaluaciones
 TOP_N = 15           # pools más grandes a evaluar
 NEAR_PCT = 0.005     # 0.5% de distancia para considerar liquidación "en el pool"
-BASELINE_DRAWS = 20  # muestras aleatorias del baseline
+BASELINE_DRAWS = 20  # muestras aleatorias de cada null
 RNG = np.random.default_rng(42)
 
 
@@ -64,6 +68,18 @@ def pools_from_cohorts(cohorts: list) -> pd.DataFrame:
     return df.groupby(["bucket", "side"]).usd.sum().reset_index()
 
 
+def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray) -> float:
+    """% del USD liquidado que cae a < NEAR_PCT de algún nivel del lado correcto."""
+    if len(usd) == 0 or usd.sum() <= 0:
+        return float("nan")
+    near = np.zeros(len(exec_px), dtype=bool)
+    for bucket, side in levels:
+        same = is_long if side == "long" else ~is_long
+        d = np.abs(exec_px - bucket) / bucket
+        near |= same & (d <= NEAR_PCT)
+    return float(usd[near].sum() / usd.sum())
+
+
 def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict | None:
     """Una evaluación walk-forward: mapa en t, validación en [t, t+LOOKAHEAD)."""
     train = snap[(snap.ts >= start - pd.Timedelta(days=WINDOW_DAYS)) & (snap.ts < start)]
@@ -79,46 +95,57 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
     px0 = float(train["px"].iloc[-1])
     lo, hi = float(test["px"].min()), float(test["px"].max())
 
-    model_hits = []
-    for _, p in pools.iterrows():
-        touched = (p.side == "long" and lo <= p.bucket) or (p.side == "short" and hi >= p.bucket)
-        model_hits.append(bool(touched))
-    model_hit = float(np.mean(model_hits))
+    # Descriptivo: perfil de distancia y pools tocados (NO es prueba de habilidad)
+    model_levels = [(float(b), s) for b, s in zip(pools.bucket, pools.side)]
+    dists = np.abs(pools.bucket.values / px0 - 1)
+    touched = [
+        (s == "long" and lo <= b) or (s == "short" and hi >= b)
+        for b, s in model_levels
+    ]
+    model_hit = float(np.mean(touched))
+    mean_dist = float(np.mean(dists))
 
-    base_hits = []
-    for _ in range(BASELINE_DRAWS):
-        lv = RNG.uniform(px0 * 0.90, px0 * 1.10, size=len(pools))
-        sd = RNG.choice(["long", "short"], size=len(pools))
-        th = np.mean([
-            (s == "long" and lo <= l) or (s == "short" and hi >= l)
-            for l, s in zip(lv, sd)
-        ])
-        base_hits.append(float(th))
-    base_hit = float(np.mean(base_hits))
+    # Nulls: mismas N pools, colocaciones aleatorias
+    long_frac = float((pools.side == "long").mean())
+    p_side = [long_frac, 1 - long_frac]
 
     look = liq[(liq.ts >= start) & (liq.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
-    if len(look) > 0 and look.usd.sum() > 0:
-        near_usd = 0.0
-        for _, p in pools.iterrows():
-            side_mask = look.is_long_liq if p.side == "long" else ~look.is_long_liq
-            dist = (look.exec_px - p.bucket).abs() / p.bucket
-            near_usd += float(look[side_mask & (dist <= NEAR_PCT)].usd.sum())
-        capture = near_usd / float(look.usd.sum())
-    else:
-        capture = float("nan")
+    if len(look) == 0 or look.usd.sum() <= 0:
+        return None  # sin liquidaciones en la ventana no hay nada que capturar
+    exec_px = look.exec_px.values
+    is_long = look.is_long_liq.values
+    usd = look.usd.values
+
+    capture_model = capture_of(model_levels, exec_px, is_long, usd)
+
+    null_u, null_m = [], []
+    for _ in range(BASELINE_DRAWS):
+        # Null uniforme: distancias uniformes 0-10%, lados aleatorios
+        du = RNG.uniform(0, 0.10, size=len(pools))
+        su = RNG.choice(["long", "short"], size=len(pools), p=p_side)
+        lv_u = [(px0 * (1 - d if s == "long" else 1 + d), s) for d, s in zip(du, su)]
+        null_u.append(capture_of(lv_u, exec_px, is_long, usd))
+        # Null distancia-emparejada: mismas distancias (permutadas), lados aleatorios
+        dm = RNG.permutation(dists)
+        sm = RNG.choice(["long", "short"], size=len(pools), p=p_side)
+        lv_m = [(px0 * (1 - d if s == "long" else 1 + d), s) for d, s in zip(dm, sm)]
+        null_m.append(capture_of(lv_m, exec_px, is_long, usd))
 
     return {
         "start": start,
         "n_pools": len(pools),
+        "liq_usd": float(usd.sum()),
         "model_hit": model_hit,
-        "base_hit": base_hit,
-        "capture": capture,
+        "mean_dist": mean_dist,
+        "capture": capture_model,
+        "null_u": float(np.mean(null_u)),
+        "null_m": float(np.mean(null_m)),
     }
 
 
 def main() -> None:
     hours = hourly_targets()
-    print(f"Backtest {SYMBOL}: {DAYS}d de datos | ventana {WINDOW_DAYS}d | "
+    print(f"Backtest v2 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
           f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
@@ -138,50 +165,62 @@ def main() -> None:
     df = pd.DataFrame(rows)
     df["start"] = df["start"].dt.strftime("%m-%d %H:%M")
 
+    cap_m = df.capture.mean()
+    cap_u = df.null_u.mean()
+    cap_mm = df.null_m.mean()
+
     print("========== RESULTADOS POR EVALUACIÓN ==========")
-    print(f"{'Paso':>12} | {'Hit modelo':>10} | {'Hit azar':>9} | {'Captura':>8}")
-    print("-" * 50)
+    print(f"{'Paso':>12} | {'Liq USD':>10} | {'Cap modelo':>10} | {'Cap azar±10%':>12} | {'Cap dist-emp':>12}")
+    print("-" * 68)
     for _, r in df.iterrows():
-        cap = f"{r.capture*100:.1f}%" if r.capture == r.capture else "n/a"
-        print(f"{r['start']:>12} | {r.model_hit*100:>9.0f}% | {r.base_hit*100:>8.0f}% | {cap:>8}")
+        print(f"{r['start']:>12} | {r.liq_usd:>10,.0f} | {r.capture*100:>9.1f}% | "
+              f"{r.null_u*100:>11.1f}% | {r.null_m*100:>11.1f}%")
 
     print("\n========== RESUMEN ==========")
-    print(f"Evaluaciones:            {len(df)}")
-    print(f"Hit-rate del modelo:     {df.model_hit.mean()*100:.1f}%")
-    print(f"Hit-rate del azar:       {df.base_hit.mean()*100:.1f}%")
-    edge = (df.model_hit.mean() - df.base_hit.mean()) * 100
-    print(f"Ventaja sobre el azar:   {edge:+.1f} puntos")
-    capture_mean = df.capture.mean() if df.capture.notna().any() else float("nan")
-    if capture_mean == capture_mean:
-        print(f"Captura media:           {capture_mean*100:.1f}% "
-              f"(liquidaciones reales ocurridas en pools predichos)")
+    print(f"Evaluaciones:                     {len(df)}")
+    print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
+    print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
+    print(f"Captura del modelo:               {cap_m*100:.1f}%")
+    print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
+    print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
+    print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
+    print(f"Ventaja vs dist-emparejada:       {(cap_mm and (cap_m-cap_mm))*100:+.1f} puntos")
 
-    if edge > 0:
-        verdict = "El modelo SUPERA al baseline aleatorio en esta muestra."
+    edge_u = (cap_m - cap_u) * 100
+    edge_m = (cap_m - cap_mm) * 100
+    if edge_m > 0 and edge_u > 0:
+        verdict = ("El modelo captura más liquidaciones reales que ambos nulls: "
+                   "hay señal de localización.")
+    elif edge_u > 0:
+        verdict = ("El modelo supera al azar uniforme pero no al null "
+                   "distancia-emparejado: señal débil o nula.")
     else:
-        verdict = "El modelo NO supera al azar en esta muestra: ajustar parámetros."
+        verdict = "El modelo NO supera a los nulls: sin señal en esta muestra."
+
     print(f"\n{verdict}")
 
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest — {SYMBOL}",
+        f"# Resultado del último backtest (v2) — {SYMBOL}",
         "",
         f"- Ejecutado: {now}",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
         f"paso {STEP_H}h · top {TOP_N} pools",
         f"- Evaluaciones: {len(df)}",
-        f"- Hit-rate modelo: **{df.model_hit.mean()*100:.1f}%**",
-        f"- Hit-rate azar: **{df.base_hit.mean()*100:.1f}%**",
-        f"- Ventaja: **{edge:+.1f} puntos**",
+        f"- Captura del modelo: **{cap_m*100:.1f}%**",
+        f"- Captura null uniforme: **{cap_u*100:.1f}%**",
+        f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%**",
+        f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** · vs emparejada: **{edge_m:+.1f} pts**",
+        "",
+        "## Por evaluación",
+        "",
+        "| Paso | Liq USD | Cap modelo | Cap uniforme | Cap emparejada |",
+        "|---|---|---|---|---|",
     ]
-    if capture_mean == capture_mean:
-        lines.append(f"- Captura media: **{capture_mean*100:.1f}%**")
-    lines += ["", "## Por evaluación", "",
-              "| Paso | Hit modelo | Hit azar | Captura |", "|---|---|---|---|"]
     for _, r in df.iterrows():
-        cap = f"{r.capture*100:.1f}%" if r.capture == r.capture else "n/a"
-        lines.append(f"| {r['start']} | {r.model_hit*100:.0f}% | {r.base_hit*100:.0f}% | {cap} |")
+        lines.append(f"| {r['start']} | {r.liq_usd:,.0f} | {r.capture*100:.1f}% | "
+                     f"{r.null_u*100:.1f}% | {r.null_m*100:.1f}% |")
     lines += ["", f"**Veredicto:** {verdict}",
               "", "_Muestra limitada por el free tier; ampliable a meses con API key gratuita._"]
     os.makedirs("results", exist_ok=True)
@@ -189,9 +228,10 @@ def main() -> None:
         f.write("\n".join(lines) + "\n")
     print("\n📄 Resultados guardados en results/last_backtest.md")
 
-    assert df.model_hit.between(0, 1).all()
-    assert df.base_hit.between(0, 1).all()
-    print("✅ Test OK: backtest ejecutado con datos reales.")
+    assert df.capture.between(0, 1).all()
+    assert df.null_u.between(0, 1).all()
+    assert df.null_m.between(0, 1).all()
+    print("✅ Test OK: backtest v2 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
