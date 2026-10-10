@@ -1,34 +1,43 @@
 """
-Modelo de pools de liquidación — Fase 2 (cohortes de OI)
+Modelo de pools de liquidación — Fase 2 (v4: funding + FIFO + margen de mantenimiento)
 
-Construye un mapa de niveles de liquidación estimados ("pools") a partir de:
-  - Open Interest: snapshots de ~5 min de Binance Futures (CryptoHFTData, gratuito, sin API key)
-  - Liquidaciones reales: para contexto y validación (mismo proveedor)
+v4 incorpora las tres mejoras con base teórica identificadas tras el backtest v3:
 
-Datasets (naming verificado en la documentación):
-  binance_futures/{fecha}/{hora}/BTCUSDT_open_interest.parquet
-    -> received_time, symbol, sum_open_interest (BTC), sum_open_interest_value (USD), timestamp (ms)
-  binance_futures/{fecha}/{hora}/BTCUSDT_liquidations.parquet
+  1. SPLIT LONG/SHORT BASADO EN FUNDING (antes: momentum 60/40)
+     El funding rate es la medida real de sesgo de posicionamiento: funding
+     positivo = los longs pagan a los shorts = exceso de longs. Se mapea a
+     long_share en [0.35, 0.65] con la escala FUNDING_SENS.
+     Fuente: dataset mark_price de CryptoHFTData (columna funding_rate, ~1s).
+
+  2. DESCUENTO FIFO POR CAÍDAS DE OI (antes: solo barrido por precio)
+     Cuando el OI baja, las cohortes más antiguas se dan por cerradas y salen
+     del mapa (las posiciones cerradas voluntariamente suelen ser antiguas).
+
+  3. MARGEN DE MANTENIMIENTO (antes: liquidación a 1/L exacto)
+     Nivel de liquidación aproximado para Binance USDT-M (margen ~0.5%):
+       long:  P * (1 - 1/L + MM)
+       short: P * (1 + 1/L - MM)
+     Con MM=0.005: un 10x long se liquida a -9.5% en vez de -10%.
+
+Datasets (naming verificado):
+  binance_futures/{fecha}/{hora}/{SYMBOL}_open_interest.parquet
+    -> sum_open_interest (BTC), sum_open_interest_value (USD), timestamp (ms)
+  binance_futures/{fecha}/{hora}/{SYMBOL}_mark_price.parquet
+    -> mark_price, funding_rate, event_time (ms)
+  binance_futures/{fecha}/{hora}/{SYMBOL}_liquidations.parquet
     -> esquema 13 columnas (ver liquidation_analysis.py)
 
-Algoritmo v1:
-  1. Cada subida de OI a un precio P = nuevas posiciones abiertas ahí (cohorte)
-  2. Split long/short heurístico según momentum del precio en el snapshot
-  3. Distribución de apalancamientos asumida: 10x/25x/50x/100x (pesos 40/30/20/10 %)
-  4. Nivel de liquidación estimado: long ≈ P*(1-1/L), short ≈ P*(1+1/L)
-  5. Al avanzar el precio, los niveles tocados se consideran barridos y salen del mapa
-  6. Los niveles supervivientes se agrupan en buckets de precio -> "pools"
-
-Simplificaciones honestas de v1 (a iterar en backtesting):
-  - Split long/short es heurístico (sin datos reales de posicionamiento por venue)
-  - Caídas de OI aún no descuentan cohortes (v2: descuento FIFO)
-  - Fórmula de liquidación sin margen de mantenimiento
+Simplificaciones honestas restantes:
+  - El FIFO asume que las posiciones cerradas son las más antiguas (aprox razonable)
+  - MM fijo del 0.5% (Binance usa escalones; aproximación de primer orden)
+  - Distribución de apalancamientos sigue asumida (10/25/50/100x)
 """
 
 import io
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -42,13 +51,14 @@ DAYS = int(os.environ.get("LIQ_DAYS", "3"))  # días de historia a modelar
 
 # (apalancamiento, peso en la distribución asumida)
 LEVERAGES = [(10, 0.40), (25, 0.30), (50, 0.20), (100, 0.10)]
-LONG_SHARE_UP = 0.60      # si el precio sube al abrirse posiciones: % asumido de longs
-LONG_SHARE_DOWN = 0.40    # si baja: % asumido de longs (más probables shorts)
-BUCKET_USD = 250          # tamaño del bucket de precio para agrupar pools
+MM = 0.005                      # margen de mantenimiento aproximado (0.5%)
+FUNDING_SENS = 3000.0           # escala: funding diario de 0.1% -> long_share 0.65
+LONG_SHARE_MIN, LONG_SHARE_MAX = 0.35, 0.65
+BUCKET_USD = 250                # tamaño del bucket de precio para agrupar pools
 
 
 def hourly_targets() -> list[datetime]:
-    """Horas UTC a descargar: las últimas DAYS*24, sin la hora en curso (aún no publicada)."""
+    """Horas UTC a descargar: las últimas DAYS*24, sin la hora en curso."""
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return [now - timedelta(hours=h) for h in range(DAYS * 24, 0, -1)]
 
@@ -86,15 +96,36 @@ def build_snapshots(oi_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_pools(snap: pd.DataFrame) -> list[dict]:
-    """Núcleo del modelo: cohortes de OI -> niveles de liquidación -> pools supervivientes."""
-    cohorts: list[dict] = []
-    swept_usd = 0.0
-    prev_qty = prev_px = None
+def build_funding_series(mp_raw: pd.DataFrame) -> pd.Series:
+    """Serie temporal de funding rate: índice ts (ms), valor float."""
+    df = mp_raw.copy()
+    df["ts"] = df["event_time"].astype("int64")
+    df["fr"] = df["funding_rate"].astype(float)
+    return df.drop_duplicates("ts").set_index("ts")["fr"].sort_index()
 
-    for px, qty in zip(snap["px"], snap["oi_qty"]):
+
+def long_share_from_funding(funding_8h: float) -> float:
+    """Mapea el funding al % de longs de la cohorte: positivo = exceso de longs."""
+    daily = funding_8h * 3.0
+    share = 0.5 + daily * FUNDING_SENS
+    return max(LONG_SHARE_MIN, min(LONG_SHARE_MAX, share))
+
+
+def build_pools(snap: pd.DataFrame, funding: pd.Series | None = None) -> list[dict]:
+    """Núcleo v4: cohortes con funding-split, barrido, descuento FIFO y margen."""
+    cohorts: deque = deque()   # FIFO: los más antiguos al frente
+    swept_usd = closed_usd = 0.0
+    prev_qty = prev_px = None
+    fr = None
+
+    for ts, px, qty in zip(snap["timestamp"], snap["px"], snap["oi_qty"]):
+        # funding vigente en este snapshot (búsqueda hacia atrás, o 0 si no hay)
+        if funding is not None and len(funding) > 0:
+            idx = funding.index.searchsorted(ts, side="right") - 1
+            fr = float(funding.iloc[idx]) if idx >= 0 else 0.0
+
         # 1) Barrido: niveles tocados por el precio salen del mapa
-        survivors = []
+        survivors = deque()
         for c in cohorts:
             if (c["side"] == "long" and px <= c["level"]) or (
                 c["side"] == "short" and px >= c["level"]
@@ -104,30 +135,44 @@ def build_pools(snap: pd.DataFrame) -> list[dict]:
                 survivors.append(c)
         cohorts = survivors
 
-        # 2) Creación: subida de OI = nuevas posiciones a este precio
+        # 2) FIFO: caída de OI cierra las cohortes más antiguas
+        if prev_qty is not None and qty < prev_qty:
+            to_close = prev_qty - qty
+            while to_close > 0 and cohorts:
+                c = cohorts[0]  # más antigua
+                qty_c = c["usd"] / c["entry_px"]
+                if qty_c <= to_close:
+                    closed_usd += c["usd"]
+                    to_close -= qty_c
+                    cohorts.popleft()
+                else:
+                    c["usd"] -= to_close * c["entry_px"]
+                    to_close = 0
+
+        # 3) Creación: subida de OI = nuevas posiciones a este precio
         if prev_qty is not None:
             d_oi = qty - prev_qty
             if d_oi > 0:
                 usd = d_oi * px
-                momentum = px - prev_px
-                long_share = (
-                    LONG_SHARE_UP if momentum > 0 else LONG_SHARE_DOWN if momentum < 0 else 0.5
-                )
+                long_share = long_share_from_funding(fr) if fr is not None else 0.5
                 for lev, weight in LEVERAGES:
                     cohorts.append({
                         "side": "long",
-                        "level": px * (1 - 1 / lev),
+                        "entry_px": px,
+                        "level": px * (1 - 1 / lev + MM),
                         "usd": usd * long_share * weight,
                     })
                     cohorts.append({
                         "side": "short",
-                        "level": px * (1 + 1 / lev),
+                        "entry_px": px,
+                        "level": px * (1 + 1 / lev - MM),
                         "usd": usd * (1 - long_share) * weight,
                     })
         prev_qty, prev_px = qty, px
 
-    print(f"  Cohortes creadas -> supervivientes: {len(cohorts)} | barridas: ${swept_usd:,.0f}")
-    return cohorts
+    print(f"  Cohortes -> supervivientes: {len(cohorts)} | barridas: ${swept_usd:,.0f} "
+          f"| cerradas FIFO: ${closed_usd:,.0f}")
+    return list(cohorts)
 
 
 def summarize(cohorts: list[dict], snap: pd.DataFrame) -> pd.DataFrame:
@@ -136,7 +181,7 @@ def summarize(cohorts: list[dict], snap: pd.DataFrame) -> pd.DataFrame:
     df["bucket"] = (df["level"] // BUCKET_USD * BUCKET_USD).astype(int)
     pools = df.groupby(["bucket", "side"]).usd.sum().reset_index()
 
-    print("\n========== MAPA DE POOLS DE LIQUIDACIÓN (estimación v1) ==========")
+    print("\n========== MAPA DE POOLS DE LIQUIDACIÓN (estimación v4) ==========")
     print(f"Símbolo: {SYMBOL} | Ventana: últimos {DAYS} días | Precio actual: ${px_now:,.0f}")
 
     longs = pools[pools.side == "long"].sort_values("usd", ascending=False).head(10)
@@ -158,28 +203,33 @@ def summarize(cohorts: list[dict], snap: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     hours = hourly_targets()
-    print(f"Descargando {len(hours)} horas de {SYMBOL} (OI + liquidaciones)...")
+    print(f"Descargando {len(hours)} horas de {SYMBOL} (OI + mark price + liquidaciones)...")
 
     oi_raw = fetch_dataset(hours, "open_interest")
     snap = build_snapshots(oi_raw)
     print(f"Snapshots de OI: {len(snap):,} (cada ~5 min)")
 
-    cohorts = build_pools(snap)
+    mp_raw = fetch_dataset(hours, "mark_price")
+    funding = build_funding_series(mp_raw)
+    print(f"Puntos de funding/mark price: {len(funding):,}")
+
+    cohorts = build_pools(snap, funding)
     pools = summarize(cohorts, snap)
 
     # Contexto: liquidaciones reales del mismo periodo
     liq = fetch_dataset(hours, "liquidations")
     liq_usd = liq.quantity.astype(float) * liq.average_price.astype(float)
-    print("\n========== LIQUIDACIONES REALES EN LA VENTANA (validación) ==========")
+    print("\n========== LIQUIDACIONES REALES EN LA VENTANA ==========")
     print(f"Eventos: {len(liq):,} | Total: ${liq_usd.sum():,.0f}")
     print(f"  Longs liquidados:  ${liq_usd[liq.side == 'SELL'].sum():,.0f}")
     print(f"  Shorts liquidados: ${liq_usd[liq.side == 'BUY'].sum():,.0f}")
 
     # Sanity checks del test de CI
     assert len(snap) > 50, "Muy pocos snapshots de OI"
+    assert len(funding) > 50, "Muy pocos puntos de funding"
     assert len(cohorts) > 0, "El modelo no generó niveles"
     assert pools["usd"].sum() > 0
-    print("\n✅ Test OK: modelo de pools generado con datos reales.")
+    print("\n✅ Test OK: modelo v4 generado con datos reales.")
 
 
 if __name__ == "__main__":
