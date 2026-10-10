@@ -1,24 +1,21 @@
 """
-Backtesting del modelo de pools de liquidación — v5: pools × absorción del libro
+Backtesting del modelo de pools de liquidación — v5.1: pools × absorción del libro
 
 Historia de versiones:
   v1-v3: iteraciones de métrica y horizonte (ver historial en git).
   v4.1: funding-split + FIFO sembrado + margen. 30d: -1.4 uniforme, +1.8 emparejado.
   v4.2: ranking por peligrosidad (usd/distancia). 30d: +19.0 uniforme pero -0.4
-      emparejado — la mejora venía de seleccionar pools CERCANOS (alcanzabilidad),
-      no de conocimiento del modelo. Cualquier nivel a la misma distancia lo
-      hace igual. Conclusión: el valor diferencial NO puede venir de la distancia.
-  v5: EL DIFERENCIAL — ranking por ratio cascada/absorción usando profundidad
-      real del order book L2 (book_depth.py). Hypótesis: los pools cuya
-      liquidación el libro NO puede absorber (ratio alto) capturan más
-      liquidaciones reales que pools comparables con libro grueso. Ninguna
-      plataforma (Coinglass/SwoleCharts) integra esta capa.
-
-Diseño de presupuesto de datos (orderbook pesa ~5.4M filas/hora):
-  - OI/funding/liquidations: LIQ_DAYS (default 14) de historia.
-  - Order book: solo las últimas LIQ_BOOK_HOURS horas (default 24), una
-    reconstrucción por hora, para no reventar memoria/tiempo de CI.
-    El ratio se calcula con el libro más reciente antes de cada evaluación.
+      emparejado — la mejora venía de la alcanzabilidad, no del conocimiento.
+  v5: ranking por ratio cascada/absorción (order book L2). FALLÓ en CI:
+      0 evaluaciones — el libro solo cubría 24h pero el filtro exigía
+      profundidad medida, y las bandas ±0.5% alrededor de pools alejados del
+      mid quedaban vacías (libro parcial) → ratio inf → todo excluido.
+  v5.1: fixes:
+      a) Libro de 72h (12+ evaluaciones cubiertas) y 1.2M filas/hora.
+      b) Fallback de profundidad: banda vacía → profundidad TOTAL del lado
+         como cota conservadora (el libro parcial subestima; usar el total
+         del lado evita excluir la evaluación). Documentado como aproximación.
+      c) assert evalúa >= 5 con mensaje claro.
 
 Resultados -> results/last_backtest.md (el CI los commitea al repo).
 """
@@ -44,7 +41,7 @@ from pool_model import (
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
 DAYS = int(os.environ.get("LIQ_DAYS", "14"))
 LOOKAHEAD_H = int(os.environ.get("LIQ_LOOKAHEAD_H", "48"))
-BOOK_HOURS = int(os.environ.get("LIQ_BOOK_HOURS", "24"))
+BOOK_HOURS = int(os.environ.get("LIQ_BOOK_HOURS", "72"))
 
 WINDOW_DAYS = 1      # historia para construir el mapa en cada paso
 STEP_H = 6           # paso entre evaluaciones
@@ -77,6 +74,26 @@ def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray
     return float(usd[near].sum() / usd.sum())
 
 
+def depth_for_pool(depth_idx, ts_ms: int, price: float, side_book: str) -> float:
+    """Profundidad para un pool con fallback v5.1.
+
+    1) Banda ±DEPTH_PCT alrededor del nivel del pool.
+    2) Si la banda está vacía (libro parcial lejos del nivel): USD TOTALES
+       del lado como cota conservadora — mejor que excluir la evaluación.
+       (Caveat: subestima el ratio cascada de pools lejanos; documentado.)
+    """
+    d = depth_idx.depth_within(ts_ms, price, side_book, DEPTH_PCT)
+    if d == d and d > 0:
+        return d
+    keys = sorted(k for k in depth_idx.books if k <= ts_ms)
+    if not keys:
+        return float("nan")
+    bids, asks = depth_idx.books[keys[-1]]
+    book = bids if side_book == "bid" else asks
+    total = sum(px * qty for px, qty in book.items())
+    return total if total > 0 else float("nan")
+
+
 def evaluate(snap, funding, liq, depth_idx, start: pd.Timestamp) -> dict | None:
     """Evaluación walk-forward: pools rankeados por ratio cascada/absorción."""
     train = snap[(snap.ts >= start - pd.Timedelta(days=WINDOW_DAYS)) & (snap.ts < start)]
@@ -93,24 +110,21 @@ def evaluate(snap, funding, liq, depth_idx, start: pd.Timestamp) -> dict | None:
     df = all_pools.copy()
     df["dist"] = (df["bucket"] / px0 - 1).abs()
 
-    # ---- v5: ratio cascada/absorción con el libro más reciente ----
+    # ---- v5.1: ratio cascada/absorción con fallback ----
     ts_ms = int(start.value // 10**6)  # ms de la evaluación
     depths, ratios = [], []
     for _, row in df.iterrows():
-        # pool long → liquidación es venta → la absorbe el lado BID (debajo)
         side_book = "bid" if row["side"] == "long" else "ask"
-        d = depth_idx.depth_within(ts_ms, float(row["bucket"]), side_book, DEPTH_PCT)
+        d = depth_for_pool(depth_idx, ts_ms, float(row["bucket"]), side_book)
         depths.append(d)
-        ratios.append(row["usd"] / d if d and d == d and d > 0 else float("inf"))
+        ratios.append(row["usd"] / d if d == d and d > 0 else float("inf"))
 
     df["book_usd"] = depths
     df["cascade"] = ratios
-    # Solo pools alcanzables (distancia razonable) y con libro medido
     df = df[(df["dist"] <= 0.10) & np.isfinite(df["cascade"])]
     if df.empty:
         return None
 
-    # Ranking v5: pools más grandes RELATIVOS a lo que el libro absorbe
     pools = df.sort_values("cascade", ascending=False).head(TOP_N).reset_index(drop=True)
 
     lo, hi = float(test["px"].min()), float(test["px"].max())
@@ -124,7 +138,6 @@ def evaluate(snap, funding, liq, depth_idx, start: pd.Timestamp) -> dict | None:
     mean_dist = float(np.mean(dists))
     mean_cascade = float(pools.cascade.mean())
 
-    # Nulls: mismas N pools, colocaciones aleatorias
     long_frac = float((pools.side == "long").mean())
     p_side = [long_frac, 1 - long_frac]
 
@@ -163,10 +176,10 @@ def evaluate(snap, funding, liq, depth_idx, start: pd.Timestamp) -> dict | None:
 
 def main() -> None:
     hours = hourly_targets()
-    print(f"Backtest v5 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
+    print(f"Backtest v5.1 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
           f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools "
           f"| libro: últimas {BOOK_HOURS}h")
-    print("Modelo v5 = v4.1 + ranking por ratio cascada/absorción (order book L2)\n")
+    print("Modelo v5.1 = v4.1 + ranking por ratio cascada/absorción (order book L2)\n")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
     funding = build_funding_series(fetch_dataset(hours, "mark_price"))
@@ -174,8 +187,7 @@ def main() -> None:
     print(f"Snapshots OI: {len(snap):,} | Puntos funding: {len(funding):,} | "
           f"Liquidaciones: {len(liq):,}")
 
-    # Order book: solo las últimas BOOK_HOURS horas (las evaluaciones usan el
-    # libro más reciente <= su timestamp; con 24h cubrimos el último día)
+    # Order book: últimas BOOK_HOURS horas (72h -> ~12 evaluaciones cubiertas)
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     book_hours = [now - timedelta(hours=h) for h in range(BOOK_HOURS, 0, -1)]
     depth_idx = fetch_book_hours(book_hours)
@@ -190,7 +202,10 @@ def main() -> None:
             rows.append(r)
         t += pd.Timedelta(hours=STEP_H)
 
-    assert len(rows) >= 5, f"Muy pocas evaluaciones ({len(rows)}) — ampliar LIQ_DAYS"
+    assert len(rows) >= 5, (
+        f"Muy pocas evaluaciones ({len(rows)}) — ampliar LIQ_BOOK_HOURS "
+        f"(actual: {BOOK_HOURS}h) o LIQ_DAYS"
+    )
     df = pd.DataFrame(rows)
     df["start"] = df["start"].dt.strftime("%m-%d %H:%M")
 
@@ -211,7 +226,7 @@ def main() -> None:
     print(f"Ratio cascada medio (usd/libro):  {df.mean_cascade.mean():.2f}")
     print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
     print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
-    print(f"Captura del modelo v5:            {cap_m*100:.1f}%")
+    print(f"Captura del modelo v5.1:          {cap_m*100:.1f}%")
     print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
     print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
     print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
@@ -220,13 +235,13 @@ def main() -> None:
     edge_u = (cap_m - cap_u) * 100
     edge_m = (cap_m - cap_mm) * 100
     if edge_m > 0 and edge_u > 0:
-        verdict = ("El modelo v5 captura más liquidaciones reales que ambos nulls: "
+        verdict = ("El modelo v5.1 captura más liquidaciones reales que ambos nulls: "
                    "señal de cascada/absorción confirmada.")
     elif edge_m > 0:
-        verdict = ("El modelo v5 supera el null estricto pero no al uniforme: "
+        verdict = ("El modelo v5.1 supera el null estricto pero no al uniforme: "
                    "mejora parcial.")
     else:
-        verdict = "El modelo v5 NO supera a los nulls: iterar."
+        verdict = "El modelo v5.1 NO supera a los nulls: iterar."
 
     print(f"\n{verdict}")
     print("(Referencias 14d: v4.1 45.0%/+3.6/+2.4 · v4.2 60.7%/+19.0/-0.4)")
@@ -234,15 +249,15 @@ def main() -> None:
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now_s = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest (v5) — {SYMBOL}",
+        f"# Resultado del último backtest (v5.1) — {SYMBOL}",
         "",
         f"- Ejecutado: {now_s}",
-        f"- Modelo: **v5** (v4.1 + ranking por ratio cascada/absorción con order book L2)",
+        f"- Modelo: **v5.1** (v4.1 + ranking por ratio cascada/absorción con order book L2)",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
         f"libro L2: últimas {BOOK_HOURS}h",
         f"- Evaluaciones: {len(df)}",
         f"- Ratio cascada medio: **{df.mean_cascade.mean():.2f}** (usd del pool / usd absorbible)",
-        f"- Captura del modelo v5: **{cap_m*100:.1f}%** (v4.1/14d: 45.0%)",
+        f"- Captura del modelo v5.1: **{cap_m*100:.1f}%** (v4.1/14d: 45.0%)",
         f"- Captura null uniforme: **{cap_u*100:.1f}%**",
         f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%**",
         f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** · vs emparejada: **{edge_m:+.1f} pts**",
@@ -265,7 +280,7 @@ def main() -> None:
     assert df.capture.between(0, 1).all()
     assert df.null_u.between(0, 1).all()
     assert df.null_m.between(0, 1).all()
-    print("✅ Test OK: backtest v5 ejecutado con datos reales.")
+    print("✅ Test OK: backtest v5.1 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
