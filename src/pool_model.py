@@ -18,6 +18,11 @@ Mejoras v4 originales (tras backtest v3):
   2. DESCUENTO FIFO POR CAÍDAS DE OI (ahora con semilla inicial)
   3. MARGEN DE MANTENIMIENTO: long P*(1-1/L+MM), short P*(1+1/L-MM), MM=0.5%
 
+API KEY (opcional, cuenta gratuita): con CRYPTOHFTDATA_API_KEY en el entorno,
+las descargas van autenticadas (rate limits ilimitados según su documentación)
+y sin clave usan el free tier (~60 req/min). La clave NUNCA se commitea al
+repo: en CI llega como GitHub Secret.
+
 Datasets (naming verificado):
   binance_futures/{fecha}/{hora}/{SYMBOL}_open_interest.parquet
   binance_futures/{fecha}/{hora}/{SYMBOL}_mark_price.parquet
@@ -39,6 +44,7 @@ import pandas as pd
 import requests
 
 CRYPTOHFTDATA_DOWNLOAD = "https://api.cryptohftdata.com/download"
+API_KEY = os.environ.get("CRYPTOHFTDATA_API_KEY", "").strip() or None
 
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
 EXCHANGE = "binance_futures"
@@ -51,6 +57,10 @@ FUNDING_SENS = 3000.0           # escala: funding diario de 0.1% -> long_share 0
 LONG_SHARE_MIN, LONG_SHARE_MAX = 0.35, 0.65
 BUCKET_USD = 250                # tamaño del bucket de precio para agrupar pools
 
+# free tier sin clave: ~60 req/min -> 1.05s entre peticiones
+# con clave autenticada: límites ilimitados, pero seguimos siendo educados (0.15s)
+REQUEST_GAP = 0.15 if API_KEY else 1.05
+
 
 def hourly_targets() -> list[datetime]:
     """Horas UTC a descargar: las últimas DAYS*24, sin la hora en curso."""
@@ -59,22 +69,28 @@ def hourly_targets() -> list[datetime]:
 
 
 def fetch_dataset(hours: list[datetime], dataset: str) -> pd.DataFrame:
-    """Descarga un dataset horario respetando el rate limit del free tier (~60 req/min)."""
+    """Descarga un dataset horario. Con API key va autenticado (X-API-Key)."""
+    headers = {"X-API-Key": API_KEY} if API_KEY else {}
+    tier = "autenticado" if API_KEY else "free tier (60 req/min)"
     frames = []
     ok = 0
     for i, dt in enumerate(hours, 1):
         path = f"{EXCHANGE}/{dt:%Y-%m-%d}/{dt:%H}/{SYMBOL}_{dataset}.parquet"
         url = f"{CRYPTOHFTDATA_DOWNLOAD}?file={path}"
         try:
-            resp = requests.get(url, timeout=60)
+            resp = requests.get(url, headers=headers, timeout=60)
             if resp.status_code == 200:
                 frames.append(pd.read_parquet(io.BytesIO(resp.content)))
                 ok += 1
+            elif resp.status_code == 429:
+                retry = int(resp.headers.get("Retry-After", "5"))
+                print(f"  [{dataset}] 429 rate limit: esperando {retry}s...")
+                time.sleep(retry)
         except requests.RequestException:
             pass  # hora perdida: continuamos
         if i % 24 == 0:
-            print(f"  [{dataset}] {i}/{len(hours)} horas procesadas ({ok} con datos)")
-        time.sleep(1.05)  # rate limit free tier
+            print(f"  [{dataset}] {i}/{len(hours)} horas procesadas ({ok} con datos, {tier})")
+        time.sleep(REQUEST_GAP)
     if not frames:
         raise RuntimeError(f"No se pudo descargar ningún archivo de {dataset}")
     return pd.concat(frames, ignore_index=True)
