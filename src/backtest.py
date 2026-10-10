@@ -1,21 +1,22 @@
 """
-Backtesting del modelo de pools de liquidación — Fase 2b (v3)
+Backtesting del modelo de pools de liquidación — Fase 2b (v4)
 
-v1: hit-rate vs azar uniforme — injusto (los pools del modelo están lejos por
-    construcción; el azar ganaba por colocar niveles cerca).
-v2: captura vs nulls (uniforme y distancia-emparejada) con lookahead 12h.
-    Resultado: gana al emparejado (+7 pts) pero pierde al uniforme (-6.5 pts):
-    en 12h las liquidaciones ocurren cerca del precio, donde el modelo por
-    diseño no señala.
-v3: lookahead configurable por entorno (default 48h) — el mapa de pools es una
-    herramienta de días, no de horas.
+Historia de versiones:
+  v1: hit-rate vs azar uniforme — injusta (los pools del modelo están lejos por
+      construcción; el azar ganaba por colocar niveles cerca).
+  v2: captura vs nulls (uniforme y distancia-emparejada), lookahead 12h.
+      Gana al emparejado (+7 pts) pero pierde al uniforme (-6.5 pts).
+  v3: lookahead 48h, 14d de datos, 44 evaluaciones. La señal se diluye:
+      -2.5 vs uniforme, +0.6 vs emparejado -> modelo v1 marginal.
+  v4: valida el MODELO v4 (funding-split + FIFO + margen de mantenimiento).
+      Mismas métricas y nulls que v3 para comparación directa apples-to-apples.
 
 Resultados -> results/last_backtest.md (el CI los commitea al repo).
 
 Limitaciones honestas:
   - Liquidaciones de Binance capadas (1 BTC/evento): magnitudes sesgadas a la
     baja, pero las UBICACIONES son reales (la validación se basa en ubicación).
-  - Muestra pequeña (free tier). Ampliable a meses con API key gratuita.
+  - Muestra de semanas (free tier). Ampliable a meses con API key gratuita.
 """
 
 import os
@@ -27,6 +28,7 @@ import pandas as pd
 
 from pool_model import (
     BUCKET_USD,
+    build_funding_series,
     build_pools,
     build_snapshots,
     fetch_dataset,
@@ -34,8 +36,8 @@ from pool_model import (
 )
 
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
-DAYS = int(os.environ.get("LIQ_DAYS", "7"))
-LOOKAHEAD_H = int(os.environ.get("LIQ_LOOKAHEAD_H", "48"))  # v3: horizonte de días
+DAYS = int(os.environ.get("LIQ_DAYS", "14"))
+LOOKAHEAD_H = int(os.environ.get("LIQ_LOOKAHEAD_H", "48"))
 
 WINDOW_DAYS = 1      # historia para construir el mapa en cada paso
 STEP_H = 6           # paso entre evaluaciones
@@ -73,14 +75,14 @@ def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray
     return float(usd[near].sum() / usd.sum())
 
 
-def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict | None:
-    """Una evaluación walk-forward: mapa en t, validación en [t, t+LOOKAHEAD)."""
+def evaluate(snap, funding, liq, start: pd.Timestamp) -> dict | None:
+    """Una evaluación walk-forward: mapa v4 en t, validación en [t, t+LOOKAHEAD)."""
     train = snap[(snap.ts >= start - pd.Timedelta(days=WINDOW_DAYS)) & (snap.ts < start)]
     test = snap[(snap.ts >= start) & (snap.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
     if len(train) < 100 or len(test) < 10:
         return None
 
-    cohorts = build_pools(train)
+    cohorts = build_pools(train, funding)
     pools = pools_from_cohorts(cohorts).sort_values("usd", ascending=False).head(TOP_N)
     if pools.empty:
         return None
@@ -104,7 +106,7 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
 
     look = liq[(liq.ts >= start) & (liq.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
     if len(look) == 0 or look.usd.sum() <= 0:
-        return None  # sin liquidaciones en la ventana no hay nada que capturar
+        return None
     exec_px = look.exec_px.values
     is_long = look.is_long_liq.values
     usd = look.usd.values
@@ -113,12 +115,10 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
 
     null_u, null_m = [], []
     for _ in range(BASELINE_DRAWS):
-        # Null uniforme: distancias uniformes 0-10%, lados aleatorios
         du = RNG.uniform(0, 0.10, size=len(pools))
         su = RNG.choice(["long", "short"], size=len(pools), p=p_side)
         lv_u = [(px0 * (1 - d if s == "long" else 1 + d), s) for d, s in zip(du, su)]
         null_u.append(capture_of(lv_u, exec_px, is_long, usd))
-        # Null distancia-emparejada: mismas distancias (permutadas), lados aleatorios
         dm = RNG.permutation(dists)
         sm = RNG.choice(["long", "short"], size=len(pools), p=p_side)
         lv_m = [(px0 * (1 - d if s == "long" else 1 + d), s) for d, s in zip(dm, sm)]
@@ -138,18 +138,21 @@ def evaluate(snap: pd.DataFrame, liq: pd.DataFrame, start: pd.Timestamp) -> dict
 
 def main() -> None:
     hours = hourly_targets()
-    print(f"Backtest v3 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
+    print(f"Backtest v4 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
           f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools")
+    print("Modelo v4: funding-split + FIFO + margen de mantenimiento\n")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
+    funding = build_funding_series(fetch_dataset(hours, "mark_price"))
     liq = prep_liquidations(fetch_dataset(hours, "liquidations"))
-    print(f"Snapshots de OI: {len(snap):,} | Liquidaciones reales: {len(liq):,}\n")
+    print(f"Snapshots OI: {len(snap):,} | Puntos funding: {len(funding):,} | "
+          f"Liquidaciones: {len(liq):,}\n")
 
     t = snap.ts.min() + pd.Timedelta(days=WINDOW_DAYS)
     t_end = snap.ts.max() - pd.Timedelta(hours=LOOKAHEAD_H)
     rows = []
     while t <= t_end:
-        r = evaluate(snap, liq, t)
+        r = evaluate(snap, funding, liq, t)
         if r:
             rows.append(r)
         t += pd.Timedelta(hours=STEP_H)
@@ -174,7 +177,7 @@ def main() -> None:
     print(f"Lookahead:                        {LOOKAHEAD_H}h")
     print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
     print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
-    print(f"Captura del modelo:               {cap_m*100:.1f}%")
+    print(f"Captura del modelo v4:            {cap_m*100:.1f}%")
     print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
     print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
     print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
@@ -183,29 +186,32 @@ def main() -> None:
     edge_u = (cap_m - cap_u) * 100
     edge_m = (cap_m - cap_mm) * 100
     if edge_m > 0 and edge_u > 0:
-        verdict = ("El modelo captura más liquidaciones reales que ambos nulls: "
-                   "hay señal de localización.")
+        verdict = ("El modelo v4 captura más liquidaciones reales que ambos nulls: "
+                   "señal de localización confirmada.")
     elif edge_m > 0:
-        verdict = ("El modelo supera el null estricto (distancia-emparejada) "
-                   "pero no al uniforme: señal de ubicación, horizonte aún corto.")
+        verdict = ("El modelo v4 supera el null estricto pero no al uniforme: "
+                   "mejora, horizonte aún corto.")
     else:
-        verdict = "El modelo NO supera a los nulls: sin señal en esta muestra."
+        verdict = "El modelo v4 NO supera a los nulls: iterar de nuevo."
 
     print(f"\n{verdict}")
+    print("(Comparar con v3: captura 39.6%, uniforme 42.1%, emparejada 39.0%)")
 
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest (v3) — {SYMBOL}",
+        f"# Resultado del último backtest (v4) — {SYMBOL}",
         "",
         f"- Ejecutado: {now}",
+        f"- Modelo: **v4** (funding-split + FIFO + margen de mantenimiento)",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
         f"paso {STEP_H}h · top {TOP_N} pools",
         f"- Evaluaciones: {len(df)}",
-        f"- Captura del modelo: **{cap_m*100:.1f}%**",
-        f"- Captura null uniforme: **{cap_u*100:.1f}%**",
-        f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%**",
-        f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** · vs emparejada: **{edge_m:+.1f} pts**",
+        f"- Captura del modelo v4: **{cap_m*100:.1f}%** (v3: 39.6%)",
+        f"- Captura null uniforme: **{cap_u*100:.1f}%** (v3: 42.1%)",
+        f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%** (v3: 39.0%)",
+        f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** (v3: -2.5) · "
+        f"vs emparejada: **{edge_m:+.1f} pts** (v3: +0.6)",
         "",
         "## Por evaluación",
         "",
@@ -216,7 +222,7 @@ def main() -> None:
         lines.append(f"| {r['start']} | {r.liq_usd:,.0f} | {r.capture*100:.1f}% | "
                      f"{r.null_u*100:.1f}% | {r.null_m*100:.1f}% |")
     lines += ["", f"**Veredicto:** {verdict}",
-              "", "_Muestra limitada por el free tier; ampliable a meses con API key gratuita._"]
+              "", "_Muestra de semanas (free tier); ampliable a meses con API key gratuita._"]
     os.makedirs("results", exist_ok=True)
     with open("results/last_backtest.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -225,7 +231,7 @@ def main() -> None:
     assert df.capture.between(0, 1).all()
     assert df.null_u.between(0, 1).all()
     assert df.null_m.between(0, 1).all()
-    print("✅ Test OK: backtest v3 ejecutado con datos reales.")
+    print("✅ Test OK: backtest v4 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
