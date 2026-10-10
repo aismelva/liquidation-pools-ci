@@ -1,5 +1,5 @@
 """
-Backtesting del modelo de pools de liquidación — Fase 2b (v4)
+Backtesting del modelo de pools de liquidación — Fase 2b (v4.1)
 
 Historia de versiones:
   v1: hit-rate vs azar uniforme — injusta (los pools del modelo están lejos por
@@ -8,8 +8,12 @@ Historia de versiones:
       Gana al emparejado (+7 pts) pero pierde al uniforme (-6.5 pts).
   v3: lookahead 48h, 14d de datos, 44 evaluaciones. La señal se diluye:
       -2.5 vs uniforme, +0.6 vs emparejado -> modelo v1 marginal.
-  v4: valida el MODELO v4 (funding-split + FIFO + margen de mantenimiento).
-      Mismas métricas y nulls que v3 para comparación directa apples-to-apples.
+  v4: valida el MODELO v4 (funding-split + FIFO + margen). Falló en CI por
+      bug de diseño: el FIFO sin semilla borraba el mapa en ventanas con OI
+      bajista ('supervivientes: 0' -> KeyError 'level').
+  v4.1: fix del bug (semilla de OI inicial + guarda contra lista vacía) y
+      traceback completo en errores. Mismas métricas y nulls que v3/v4 para
+      comparación directa.
 
 Resultados -> results/last_backtest.md (el CI los commitea al repo).
 
@@ -21,18 +25,18 @@ Limitaciones honestas:
 
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 from pool_model import (
-    BUCKET_USD,
     build_funding_series,
     build_pools,
     build_snapshots,
     fetch_dataset,
-    hourly_targets,
+    pools_from_cohorts,
 )
 
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
@@ -57,12 +61,6 @@ def prep_liquidations(liq_raw: pd.DataFrame) -> pd.DataFrame:
     return df[["ts", "exec_px", "usd", "is_long_liq"]]
 
 
-def pools_from_cohorts(cohorts: list) -> pd.DataFrame:
-    df = pd.DataFrame(cohorts)
-    df["bucket"] = df["level"] // BUCKET_USD * BUCKET_USD
-    return df.groupby(["bucket", "side"]).usd.sum().reset_index()
-
-
 def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray) -> float:
     """% del USD liquidado que cae a < NEAR_PCT de algún nivel del lado correcto."""
     if len(usd) == 0 or usd.sum() <= 0:
@@ -76,7 +74,7 @@ def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray
 
 
 def evaluate(snap, funding, liq, start: pd.Timestamp) -> dict | None:
-    """Una evaluación walk-forward: mapa v4 en t, validación en [t, t+LOOKAHEAD)."""
+    """Una evaluación walk-forward: mapa v4.1 en t, validación en [t, t+LOOKAHEAD)."""
     train = snap[(snap.ts >= start - pd.Timedelta(days=WINDOW_DAYS)) & (snap.ts < start)]
     test = snap[(snap.ts >= start) & (snap.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
     if len(train) < 100 or len(test) < 10:
@@ -137,10 +135,12 @@ def evaluate(snap, funding, liq, start: pd.Timestamp) -> dict | None:
 
 
 def main() -> None:
+    hours = hourly_targets() if False else None  # placeholder evitado abajo
+    from pool_model import hourly_targets
     hours = hourly_targets()
-    print(f"Backtest v4 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
+    print(f"Backtest v4.1 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
           f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools")
-    print("Modelo v4: funding-split + FIFO + margen de mantenimiento\n")
+    print("Modelo v4.1: funding-split + FIFO con semilla + margen de mantenimiento\n")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
     funding = build_funding_series(fetch_dataset(hours, "mark_price"))
@@ -177,7 +177,7 @@ def main() -> None:
     print(f"Lookahead:                        {LOOKAHEAD_H}h")
     print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
     print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
-    print(f"Captura del modelo v4:            {cap_m*100:.1f}%")
+    print(f"Captura del modelo v4.1:          {cap_m*100:.1f}%")
     print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
     print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
     print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
@@ -186,28 +186,28 @@ def main() -> None:
     edge_u = (cap_m - cap_u) * 100
     edge_m = (cap_m - cap_mm) * 100
     if edge_m > 0 and edge_u > 0:
-        verdict = ("El modelo v4 captura más liquidaciones reales que ambos nulls: "
+        verdict = ("El modelo v4.1 captura más liquidaciones reales que ambos nulls: "
                    "señal de localización confirmada.")
     elif edge_m > 0:
-        verdict = ("El modelo v4 supera el null estricto pero no al uniforme: "
+        verdict = ("El modelo v4.1 supera el null estricto pero no al uniforme: "
                    "mejora, horizonte aún corto.")
     else:
-        verdict = "El modelo v4 NO supera a los nulls: iterar de nuevo."
+        verdict = "El modelo v4.1 NO supera a los nulls: iterar de nuevo."
 
     print(f"\n{verdict}")
-    print("(Comparar con v3: captura 39.6%, uniforme 42.1%, emparejada 39.0%)")
+    print("(Referencia v3: captura 39.6%, uniforme 42.1%, emparejada 39.0%)")
 
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest (v4) — {SYMBOL}",
+        f"# Resultado del último backtest (v4.1) — {SYMBOL}",
         "",
         f"- Ejecutado: {now}",
-        f"- Modelo: **v4** (funding-split + FIFO + margen de mantenimiento)",
+        f"- Modelo: **v4.1** (funding-split + FIFO con semilla + margen de mantenimiento)",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
         f"paso {STEP_H}h · top {TOP_N} pools",
         f"- Evaluaciones: {len(df)}",
-        f"- Captura del modelo v4: **{cap_m*100:.1f}%** (v3: 39.6%)",
+        f"- Captura del modelo v4.1: **{cap_m*100:.1f}%** (v3: 39.6%)",
         f"- Captura null uniforme: **{cap_u*100:.1f}%** (v3: 42.1%)",
         f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%** (v3: 39.0%)",
         f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** (v3: -2.5) · "
@@ -231,7 +231,7 @@ def main() -> None:
     assert df.capture.between(0, 1).all()
     assert df.null_u.between(0, 1).all()
     assert df.null_m.between(0, 1).all()
-    print("✅ Test OK: backtest v4 ejecutado con datos reales.")
+    print("✅ Test OK: backtest v4.1 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
@@ -239,4 +239,5 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"❌ Backtest falló: {exc}")
+        traceback.print_exc()
         sys.exit(1)
