@@ -1,26 +1,30 @@
 """
-Backtesting del modelo de pools de liquidación — Fase 2b (v4.1)
+Backtesting del modelo de pools de liquidación — Fase 2b (v4.2: ranking por peligrosidad)
 
 Historia de versiones:
   v1: hit-rate vs azar uniforme — injusta (los pools del modelo están lejos por
       construcción; el azar ganaba por colocar niveles cerca).
   v2: captura vs nulls (uniforme y distancia-emparejada), lookahead 12h.
       Gana al emparejado (+7 pts) pero pierde al uniforme (-6.5 pts).
-  v3: lookahead 48h, 14d de datos, 44 evaluaciones. La señal se diluye:
-      -2.5 vs uniforme, +0.6 vs emparejado -> modelo v1 marginal.
-  v4: valida el MODELO v4 (funding-split + FIFO + margen). Falló en CI por
-      bug de diseño: el FIFO sin semilla borraba el mapa en ventanas con OI
-      bajista ('supervivientes: 0' -> KeyError 'level').
-  v4.1: fix del bug (semilla de OI inicial + guarda contra lista vacía) y
-      traceback completo en errores. Mismas métricas y nulls que v3/v4 para
-      comparación directa.
+  v3: lookahead 48h, 14d, 44 eval. Señal diluida: -2.5 uniforme, +0.6 emparejado.
+  v4.1: funding-split + FIFO sembrado + margen. 14d: +3.6/+2.4 (ambos nulls).
+      30d/108 eval: la ventaja NO se mantiene (−1.4 uniforme, +1.8 emparejado).
+      Diagnóstico: la UBICACIÓN es correcta pero el RANKING por USD puro falla —
+      un pool de $500M a 8% capta menos que uno de $80M a 1%.
+  v4.2: experimento de ranking — se seleccionan los top N pools por
+      PELIGROSIDAD = usd / distancia_al_precio, en vez de USD puro.
+      Hipótesis: ponderar por alcanzabilidad mejora la captura vs ambos nulls.
+      Todo lo demás (modelo, métricas, nulls, ventanas) idéntico a v4.1 para
+      comparación apples-to-apples.
 
 Resultados -> results/last_backtest.md (el CI los commitea al repo).
 
 Limitaciones honestas:
+  - Ranking por peligrosidad es heurístico (1/distancia); la calibración con
+    distribución real de Hyperliquid y el ratio cascada/absorción (v5, order
+    books) son los siguientes pasos naturales.
   - Liquidaciones de Binance capadas (1 BTC/evento): magnitudes sesgadas a la
-    baja, pero las UBICACIONES son reales (la validación se basa en ubicación).
-  - Muestra de semanas (free tier). Ampliable a meses con API key gratuita.
+    baja, pero las UBICACIONES son reales.
 """
 
 import os
@@ -36,19 +40,24 @@ from pool_model import (
     build_pools,
     build_snapshots,
     fetch_dataset,
+    hourly_targets,
     pools_from_cohorts,
 )
 
 SYMBOL = os.environ.get("LIQ_SYMBOL", "BTCUSDT")
-DAYS = int(os.environ.get("LIQ_DAYS", "14"))
+DAYS = int(os.environ.get("LIQ_DAYS", "30"))
 LOOKAHEAD_H = int(os.environ.get("LIQ_LOOKAHEAD_H", "48"))
 
 WINDOW_DAYS = 1      # historia para construir el mapa en cada paso
 STEP_H = 6           # paso entre evaluaciones
-TOP_N = 15           # pools más grandes a evaluar
+TOP_N = 15           # pools a evaluar
 NEAR_PCT = 0.005     # 0.5% de distancia para considerar liquidación "en el pool"
 BASELINE_DRAWS = 20  # muestras aleatorias de cada null
 RNG = np.random.default_rng(42)
+
+# v4.2: ranking por peligrosidad (usd / distancia) en vez de usd puro.
+# RANK_MODE = "usd" reproduce v4.1 exactamente (para comparar en el mismo run).
+RANK_MODE = os.environ.get("LIQ_RANK_MODE", "danger")
 
 
 def prep_liquidations(liq_raw: pd.DataFrame) -> pd.DataFrame:
@@ -73,22 +82,39 @@ def capture_of(levels, exec_px: np.ndarray, is_long: np.ndarray, usd: np.ndarray
     return float(usd[near].sum() / usd.sum())
 
 
+def select_pools(pools: pd.DataFrame, px0: float, mode: str) -> pd.DataFrame:
+    """Selecciona los TOP_N pools según el modo de ranking."""
+    df = pools.copy()
+    df["dist"] = (df["bucket"] / px0 - 1).abs()
+    if mode == "danger":
+        # peligrosidad = USD por punto porcentual de distancia (cap al 0.1%
+        # para no div-bidir por cero y premiar pools pegados al precio)
+        df["danger"] = df["usd"] / np.maximum(df["dist"], 0.001)
+        df = df.sort_values("danger", ascending=False)
+    else:  # "usd" — comportamiento v4.1
+        df = df.sort_values("usd", ascending=False)
+    return df.head(TOP_N).reset_index(drop=True)
+
+
 def evaluate(snap, funding, liq, start: pd.Timestamp) -> dict | None:
-    """Una evaluación walk-forward: mapa v4.1 en t, validación en [t, t+LOOKAHEAD)."""
+    """Una evaluación walk-forward: mapa v4.2 en t, validación en [t, t+LOOKAHEAD)."""
     train = snap[(snap.ts >= start - pd.Timedelta(days=WINDOW_DAYS)) & (snap.ts < start)]
     test = snap[(snap.ts >= start) & (snap.ts < start + pd.Timedelta(hours=LOOKAHEAD_H))]
     if len(train) < 100 or len(test) < 10:
         return None
 
     cohorts = build_pools(train, funding)
-    pools = pools_from_cohorts(cohorts).sort_values("usd", ascending=False).head(TOP_N)
-    if pools.empty:
+    all_pools = pools_from_cohorts(cohorts)
+    if all_pools.empty:
         return None
 
     px0 = float(train["px"].iloc[-1])
+    pools = select_pools(all_pools, px0, RANK_MODE)
+    if pools.empty:
+        return None
+
     lo, hi = float(test["px"].min()), float(test["px"].max())
 
-    # Descriptivo: perfil de distancia y pools tocados (NO es prueba de habilidad)
     model_levels = [(float(b), s) for b, s in zip(pools.bucket, pools.side)]
     dists = np.abs(pools.bucket.values / px0 - 1)
     touched = [
@@ -135,12 +161,11 @@ def evaluate(snap, funding, liq, start: pd.Timestamp) -> dict | None:
 
 
 def main() -> None:
-    hours = hourly_targets() if False else None  # placeholder evitado abajo
-    from pool_model import hourly_targets
     hours = hourly_targets()
-    print(f"Backtest v4.1 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
-          f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools")
-    print("Modelo v4.1: funding-split + FIFO con semilla + margen de mantenimiento\n")
+    print(f"Backtest v4.2 {SYMBOL}: {DAYS}d | ventana {WINDOW_DAYS}d | "
+          f"lookahead {LOOKAHEAD_H}h | paso {STEP_H}h | top {TOP_N} pools "
+          f"| ranking: {RANK_MODE}")
+    print("Modelo v4.2 = v4.1 + ranking por peligrosidad (usd / distancia)\n")
 
     snap = build_snapshots(fetch_dataset(hours, "open_interest"))
     funding = build_funding_series(fetch_dataset(hours, "mark_price"))
@@ -175,9 +200,10 @@ def main() -> None:
     print("\n========== RESUMEN ==========")
     print(f"Evaluaciones:                     {len(df)}")
     print(f"Lookahead:                        {LOOKAHEAD_H}h")
+    print(f"Modo de ranking:                  {RANK_MODE}")
     print(f"Distancia media de los pools:     {df.mean_dist.mean()*100:.1f}% del precio")
     print(f"Pools tocados (descriptivo):      {df.model_hit.mean()*100:.1f}%")
-    print(f"Captura del modelo v4.1:          {cap_m*100:.1f}%")
+    print(f"Captura del modelo v4.2:          {cap_m*100:.1f}%")
     print(f"Captura null uniforme (±10%):     {cap_u*100:.1f}%")
     print(f"Captura null dist-emparejada:     {cap_mm*100:.1f}%")
     print(f"Ventaja vs null uniforme:         {(cap_m-cap_u)*100:+.1f} puntos")
@@ -186,32 +212,34 @@ def main() -> None:
     edge_u = (cap_m - cap_u) * 100
     edge_m = (cap_m - cap_mm) * 100
     if edge_m > 0 and edge_u > 0:
-        verdict = ("El modelo v4.1 captura más liquidaciones reales que ambos nulls: "
+        verdict = ("El modelo v4.2 captura más liquidaciones reales que ambos nulls: "
                    "señal de localización confirmada.")
     elif edge_m > 0:
-        verdict = ("El modelo v4.1 supera el null estricto pero no al uniforme: "
+        verdict = ("El modelo v4.2 supera el null estricto pero no al uniforme: "
                    "mejora, horizonte aún corto.")
     else:
-        verdict = "El modelo v4.1 NO supera a los nulls: iterar de nuevo."
+        verdict = "El modelo v4.2 NO supera a los nulls: iterar de nuevo."
 
     print(f"\n{verdict}")
-    print("(Referencia v3: captura 39.6%, uniforme 42.1%, emparejada 39.0%)")
+    print("(Referencia v4.1 con 30d: captura 39.2%, uniforme 40.7% (-1.4), emparejada 37.4% (+1.8))")
 
     # ---- Guardar resultados en el repo (el CI los commitea) ----
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# Resultado del último backtest (v4.1) — {SYMBOL}",
+        f"# Resultado del último backtest (v4.2) — {SYMBOL}",
         "",
         f"- Ejecutado: {now}",
-        f"- Modelo: **v4.1** (funding-split + FIFO con semilla + margen de mantenimiento)",
+        f"- Modelo: **v4.2** (v4.1 + ranking por peligrosidad usd/distancia, modo `{RANK_MODE}`)",
         f"- Datos: {DAYS} días · ventana {WINDOW_DAYS}d · lookahead {LOOKAHEAD_H}h · "
         f"paso {STEP_H}h · top {TOP_N} pools",
         f"- Evaluaciones: {len(df)}",
-        f"- Captura del modelo v4.1: **{cap_m*100:.1f}%** (v3: 39.6%)",
-        f"- Captura null uniforme: **{cap_u*100:.1f}%** (v3: 42.1%)",
-        f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%** (v3: 39.0%)",
-        f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** (v3: -2.5) · "
-        f"vs emparejada: **{edge_m:+.1f} pts** (v3: +0.6)",
+        f"- Captura del modelo v4.2: **{cap_m*100:.1f}%** (v4.1/30d: 39.2%)",
+        f"- Captura null uniforme: **{cap_u*100:.1f}%** (v4.1/30d: 40.7%)",
+        f"- Captura null distancia-emparejada: **{cap_mm*100:.1f}%** (v4.1/30d: 37.4%)",
+        f"- Ventaja vs uniforme: **{edge_u:+.1f} pts** (v4.1/30d: -1.4) · "
+        f"vs emparejada: **{edge_m:+.1f} pts** (v4.1/30d: +1.8)",
+        f"- Distancia media de pools seleccionados: {df.mean_dist.mean()*100:.1f}% "
+        f"(v4.1 priorizaba pools lejanos; v4.2 debería bajar esto)",
         "",
         "## Por evaluación",
         "",
@@ -222,7 +250,7 @@ def main() -> None:
         lines.append(f"| {r['start']} | {r.liq_usd:,.0f} | {r.capture*100:.1f}% | "
                      f"{r.null_u*100:.1f}% | {r.null_m*100:.1f}% |")
     lines += ["", f"**Veredicto:** {verdict}",
-              "", "_Muestra de semanas (free tier); ampliable a meses con API key gratuita._"]
+              "", "_Con API key gratuita; ampliable a más meses._"]
     os.makedirs("results", exist_ok=True)
     with open("results/last_backtest.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -231,7 +259,7 @@ def main() -> None:
     assert df.capture.between(0, 1).all()
     assert df.null_u.between(0, 1).all()
     assert df.null_m.between(0, 1).all()
-    print("✅ Test OK: backtest v4.1 ejecutado con datos reales.")
+    print("✅ Test OK: backtest v4.2 ejecutado con datos reales.")
 
 
 if __name__ == "__main__":
