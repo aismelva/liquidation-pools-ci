@@ -44,7 +44,7 @@ jobs:
 
   fase2b-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -52,11 +52,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Fase 2b — backtesting v4.2 (ranking por peligrosidad, 30 días) contra liquidaciones reales
+      - name: Fase 2b — backtesting v5 (pools × absorción del libro L2, 14 días) contra liquidaciones reales
         env:
-          LIQ_DAYS: "30"
+          LIQ_DAYS: "14"
           LIQ_LOOKAHEAD_H: "48"
-          LIQ_RANK_MODE: "danger"
+          LIQ_BOOK_HOURS: "24"
           CRYPTOHFTDATA_API_KEY: ${{ secrets.CRYPTOHFTDATA_API_KEY }}
         run: python src/backtest.py
       - name: Publicar resultados al repo
