@@ -40,6 +40,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -56,12 +57,10 @@ FUNDING_SENS = 3000.0           # escala: funding diario de 0.1% -> long_share 0
 LONG_SHARE_MIN, LONG_SHARE_MAX = 0.35, 0.65
 BUCKET_USD = 250                # tamaño del bucket de precio para agrupar pools
 
-
 def hourly_targets() -> list[datetime]:
     """Horas UTC a descargar: las últimas DAYS*24, sin la hora en curso."""
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return [now - timedelta(hours=h) for h in range(DAYS * 24, 0, -1)]
-
 
 def fetch_dataset(hours: list[datetime], dataset: str) -> pd.DataFrame:
     """Descarga un dataset horario respetando el rate limit del free tier (~60 req/min)."""
@@ -84,7 +83,6 @@ def fetch_dataset(hours: list[datetime], dataset: str) -> pd.DataFrame:
         raise RuntimeError(f"No se pudo descargar ningún archivo de {dataset}")
     return pd.concat(frames, ignore_index=True)
 
-
 def build_snapshots(oi_raw: pd.DataFrame) -> pd.DataFrame:
     """Convierte los snapshots de OI en una serie temporal (ts, precio, OI BTC, OI USD)."""
     df = oi_raw.copy()
@@ -95,7 +93,6 @@ def build_snapshots(oi_raw: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates("timestamp").sort_values("ts").reset_index(drop=True)
     return df
 
-
 def build_funding_series(mp_raw: pd.DataFrame) -> pd.Series:
     """Serie temporal de funding rate: índice ts (ms), valor float."""
     df = mp_raw.copy()
@@ -103,13 +100,11 @@ def build_funding_series(mp_raw: pd.DataFrame) -> pd.Series:
     df["fr"] = df["funding_rate"].astype(float)
     return df.drop_duplicates("ts").set_index("ts")["fr"].sort_index()
 
-
 def long_share_from_funding(funding_8h: float) -> float:
     """Mapea el funding al % de longs de la cohorte: positivo = exceso de longs."""
     daily = funding_8h * 3.0
     share = 0.5 + daily * FUNDING_SENS
     return max(LONG_SHARE_MIN, min(LONG_SHARE_MAX, share))
-
 
 def build_pools(snap: pd.DataFrame, funding: pd.Series | None = None) -> list[dict]:
     """Núcleo v4: cohortes con funding-split, barrido, descuento FIFO y margen."""
@@ -118,7 +113,10 @@ def build_pools(snap: pd.DataFrame, funding: pd.Series | None = None) -> list[di
     prev_qty = prev_px = None
     fr = None
 
-    for ts, px, qty in zip(snap["timestamp"], snap["px"], snap["oi_qty"]):
+    ts_series = snap["timestamp"].values if "timestamp" in snap.columns else (
+        (snap["ts"].astype("int64") // 10**6)
+    )
+    for ts, px, qty in zip(ts_series, snap["px"], snap["oi_qty"]):
         # funding vigente en este snapshot (búsqueda hacia atrás, o 0 si no hay)
         if funding is not None and len(funding) > 0:
             idx = funding.index.searchsorted(ts, side="right") - 1
@@ -174,7 +172,6 @@ def build_pools(snap: pd.DataFrame, funding: pd.Series | None = None) -> list[di
           f"| cerradas FIFO: ${closed_usd:,.0f}")
     return list(cohorts)
 
-
 def summarize(cohorts: list[dict], snap: pd.DataFrame) -> pd.DataFrame:
     px_now = snap["px"].iloc[-1]
     df = pd.DataFrame(cohorts)
@@ -199,7 +196,6 @@ def summarize(cohorts: list[dict], snap: pd.DataFrame) -> pd.DataFrame:
         print(f"{r.bucket:>12,} | {r.usd:>15,.0f} | {dist:>9.1f}%")
 
     return pools
-
 
 def main() -> None:
     hours = hourly_targets()
