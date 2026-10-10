@@ -5,20 +5,21 @@ Reconstruye la profundidad agregada del libro a partir del dataset orderbook
 de CryptoHFTData (L2 snapshots + deltas, ~5.4M filas/hora en BTCUSDT).
 
 Estrategia de peso controlado (los archivos son enormes):
-  - No descargamos deltas completos: para cada hora tomamos SOLO la primera
-    ventana de eventos y acumulamos niveles hasta tener profundidad suficiente
-    (±DEPTH_PCT del precio). Es una aproximación del "libro visible" al inicio
-    de la hora, suficiente para rankear absorción.
-  - Alternativa simple usada aquí: por cada hora, parsear solo las filas con
-    event_type="snapshot" (si existen) o las primeras N filas, acumulando
-    (side, price, quantity) en un dict. Con quantity>0 añade, quantity=0 quita.
+  - Por cada hora, parseamos solo las primeras N filas del archivo
+    (max_rows_per_hour, default 1.2M): cubre snapshot inicial + deltas,
+    suficiente para profundidad cercana al mid de esa hora.
+  - Acumulamos (side, price, quantity) en dicts: quantity>0 añade, 0 quita.
+  - Un libro por hora; depth_within usa el snapshot <= timestamp pedido.
+
+Fallback de profundidad (fix v5.1): si la banda ±pct alrededor del precio no
+tiene USD medidos (libro parcial lejos del precio pedido), usamos el MEJOR
+precio disponible del lado correcto más cercano como aproximación del mid y
+devolvemos la profundidad total acumulada de ese lado — mejor que inf/nan,
+que excluía evaluaciones enteras. Ver caveats en backtest.py.
 
 API:
-  build_depth_index(hours) -> DepthIndex
-  DepthIndex.usd_within(precio, lado, pct) -> USD absorbible a ±pct del precio
-
-El ratio cascada/absorción de un pool = pool.usd / depth.usd_within(nivel).
-Ratio > 1 → el libro no puede absorber la liquidación → candidata a cascada.
+  fetch_book_hours(hours) -> DepthIndex
+  DepthIndex.depth_within(ts_ms, price, side, pct) -> USD absorbible (>=0)
 """
 
 import io
@@ -28,11 +29,11 @@ from datetime import datetime
 import pandas as pd
 import requests
 
-from pool_model import CRYPTOHFTDATA_DOWNLOAD, API_KEY, EXCHANGE, SYMBOL
+from pool_model import API_KEY, CRYPTOHFTDATA_DOWNLOAD, EXCHANGE, SYMBOL
 
 
 class DepthIndex:
-    """Índice de profundidad por hora: dict[ts_ms] -> {bid: {px: qty}, ask: {px: qty}}."""
+    """Índice de profundidad por hora: dict[ts_ms] -> (bids, asks) de px->qty."""
 
     def __init__(self):
         self.books = {}  # ts_ms -> (bids: dict[float,float], asks: dict[float,float])
@@ -40,10 +41,22 @@ class DepthIndex:
     def add_hour(self, ts_ms: int, bids: dict, asks: dict):
         self.books[ts_ms] = (bids, asks)
 
-    def depth_within(self, ts_ms: int, price: float, side: str, pct: float) -> float:
-        """USD absorbible a ±pct de `price` en el lado `side` (bid=debajo, ask=encima).
+    def best_price(self, ts_ms: int, side: str) -> float:
+        """Mejor precio del lado (bid: máximo, ask: mínimo) del libro <= ts_ms."""
+        keys = sorted(k for k in self.books if k <= ts_ms)
+        if not keys:
+            return float("nan")
+        bids, asks = self.books[keys[-1]]
+        book = bids if side == "bid" else asks
+        if not book:
+            return float("nan")
+        return max(book) if side == "bid" else min(book)
 
-        Usa el snapshot de libro más reciente <= ts_ms.
+    def depth_within(self, ts_ms: int, price: float, side: str, pct: float) -> float:
+        """USD absorbible a ±pct de `price` en el lado `side` (bid/ask).
+
+        Usa el snapshot de libro más reciente <= ts_ms. Si no hay niveles en la
+        banda (libro parcial), devuelve 0.0 — el llamador decide el fallback.
         """
         keys = sorted(k for k in self.books if k <= ts_ms)
         if not keys:
@@ -58,13 +71,8 @@ class DepthIndex:
         return usd
 
 
-def fetch_book_hours(hours: list[datetime], max_rows_per_hour: int = 400_000) -> DepthIndex:
-    """Descarga orderbook por hora y acumula el libro visible de cada hora.
-
-    max_rows_per_hour limita el parseo por archivo (los archivos tienen ~5M
-    filas; con 400k cubrimos snapshot inicial + primeros deltas, suficiente
-    para profundidad cercana al mid).
-    """
+def fetch_book_hours(hours: list[datetime], max_rows_per_hour: int = 1_200_000) -> DepthIndex:
+    """Descarga orderbook por hora y acumula el libro visible de cada hora."""
     headers = {"X-API-Key": API_KEY} if API_KEY else {}
     idx = DepthIndex()
     ok = 0
@@ -72,15 +80,14 @@ def fetch_book_hours(hours: list[datetime], max_rows_per_hour: int = 400_000) ->
         path = f"{EXCHANGE}/{dt:%Y-%m-%d}/{dt:%H}/{SYMBOL}_orderbook.parquet"
         url = f"{CRYPTOHFTDATA_DOWNLOAD}?file={path}"
         try:
-            resp = requests.get(url, headers=headers, timeout=120)
+            resp = requests.get(url, headers=headers, timeout=180)
             if resp.status_code == 200:
                 df = pd.read_parquet(io.BytesIO(resp.content))
                 if len(df) > max_rows_per_hour:
                     df = df.iloc[:max_rows_per_hour]
-                # pyarrow filtra columnas automáticamente al leer: seleccionar las presentes
-                cols = {c for c in ("event_time", "side", "price", "quantity") if c in df.columns}
-                df = df[list(cols)]
-                # timestamp de la hora (ms) — usamos el event_time máximo parseado
+                cols = [c for c in ("event_time", "side", "price", "quantity")
+                        if c in df.columns]
+                df = df[cols]
                 ts_ms = int(df["event_time"].astype("int64").max())
                 bids, asks = {}, {}
                 for side, px, qty in zip(df["side"], df["price"].astype(float),
@@ -92,7 +99,7 @@ def fetch_book_hours(hours: list[datetime], max_rows_per_hour: int = 400_000) ->
                         book.pop(px, None)
                 idx.add_hour(ts_ms, bids, asks)
                 ok += 1
-        except (requests.RequestException, Exception):
+        except Exception:
             pass  # hora perdida: continuamos
         if i % 12 == 0:
             print(f"  [orderbook] {i}/{len(hours)} horas procesadas ({ok} con libro)")
